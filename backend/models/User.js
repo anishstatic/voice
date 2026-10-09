@@ -25,7 +25,7 @@ const userSchema = new mongoose.Schema({
     type: Date, 
     default: Date.now 
   }
-});
+}, { bufferCommands: false });
 
 // Hash password before saving
 userSchema.pre('save', async function() {

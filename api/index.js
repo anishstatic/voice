@@ -1,9 +1,13 @@
+require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const User = require('./models/User');
 const Session = require('./models/Session');
+
+// Never buffer queries in serverless functions — fail fast or use established connection
+mongoose.set('bufferCommands', false);
 
 const app = express();
 
@@ -25,13 +29,14 @@ async function connectDB() {
 
   const uri = process.env.MONGODB_URI;
   if (!uri) {
-    throw new Error('MONGODB_URI is not set in Vercel Environment Variables. Please add it in Vercel Settings -> Environment Variables.');
+    throw new Error('MONGODB_URI is missing. Please set MONGODB_URI in Vercel Project Settings -> Environment Variables.');
   }
 
   if (!cached.promise) {
     const opts = {
       bufferCommands: false,
-      serverSelectionTimeoutMS: 5000,
+      serverSelectionTimeoutMS: 8000,
+      connectTimeoutMS: 10000,
     };
     cached.promise = mongoose.connect(uri, opts).then((m) => m);
   }
@@ -49,7 +54,6 @@ async function connectDB() {
 
 // Middleware to ensure DB connection before handling requests
 app.use(async (req, res, next) => {
-  // Allow health check to pass without DB
   if (req.path === '/api/health') return next();
   try {
     await connectDB();
@@ -57,7 +61,7 @@ app.use(async (req, res, next) => {
   } catch (err) {
     console.error('Database connection middleware error:', err.message);
     return res.status(503).json({ 
-      error: `Database connection failed: ${err.message}. Please check MongoDB Atlas IP Whitelist (add 0.0.0.0/0) and Vercel MONGODB_URI.` 
+      error: `Database connection error: ${err.message}. If this persists, please ensure 0.0.0.0/0 is allowed in your MongoDB Atlas Network Access.` 
     });
   }
 });
@@ -244,12 +248,11 @@ app.post('/api/chat', async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on Vercel.' });
+      return res.status(500).json({ error: 'GEMINI_API_KEY environment variable is not configured on Vercel.' });
     }
 
     const systemPrompt = `You are a ${persona || 'helpful assistant'}. Keep answers concise, natural, and conversational.`;
     
-    // Call Gemini 2.5 Flash / 3.1 Flash REST API
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -263,7 +266,6 @@ app.post('/api/chat', async (req, res) => {
     const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || "I'm here to help!";
     const tokens = data.usageMetadata?.totalTokenCount || Math.ceil((message.length + reply.length) / 4);
 
-    // Save session in MongoDB for telemetry
     try {
       await Session.create({
         sessionId: Math.random().toString(36).substring(7),
@@ -285,7 +287,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// Fallback health check
+// Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'VoiceAI Vercel Serverless API' });
 });

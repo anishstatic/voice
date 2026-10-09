@@ -8,6 +8,6 @@ const sessionSchema = new mongoose.Schema({
   estimatedCost: { type: Number, default: 0 },
   startTime: { type: Date, default: Date.now },
   endTime: { type: Date }
-});
+}, { bufferCommands: false });
 
 module.exports = mongoose.models.Session || mongoose.model('Session', sessionSchema);
