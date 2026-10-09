@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, MicOff, Send, AlertCircle, Bot, User, Sparkles, Volume2, Loader2 } from 'lucide-react';
+import { Mic, MicOff, Send, AlertCircle, Bot, User, Sparkles, Volume2, Loader2, Radio } from 'lucide-react';
 import io from 'socket.io-client';
 import axios from 'axios';
 import { API_BASE, WS_BASE } from '../config';
@@ -48,7 +48,7 @@ const VoiceAgent = () => {
   const [isSocketConnected, setIsSocketConnected] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [transcript, setTranscript] = useState([
-    { speaker: 'agent', text: "Hello! I'm your AI assistant. You can speak to me with the mic or type any question below." }
+    { speaker: 'agent', text: "Hello! I'm your AI voice assistant. Click 'Start Voice Session' for a continuous hands-free conversation, or type anytime below." }
   ]);
   const [persona, setPersona] = useState('Helpful Assistant');
   const [error, setError] = useState(null);
@@ -65,6 +65,7 @@ const VoiceAgent = () => {
   const lastPartialSpeakerRef = useRef(null);
   const chatEndRef = useRef(null);
   const recognitionRef = useRef(null);
+  const isContinuousSessionRef = useRef(false);
 
   // Auto-scroll to latest message
   useEffect(() => {
@@ -111,7 +112,11 @@ const VoiceAgent = () => {
 
       socket.on('turn-complete', () => {
         lastPartialSpeakerRef.current = null;
-        setStatus('idle');
+        if (isContinuousSessionRef.current) {
+          setStatus('listening');
+        } else {
+          setStatus('idle');
+        }
       });
 
       socket.on('transcript', (msg) => {
@@ -151,7 +156,18 @@ const VoiceAgent = () => {
   };
 
   const stopCapture = () => {
+    isContinuousSessionRef.current = false;
+    setIsActive(false);
+    setStatus('idle');
     readyRef.current = false;
+
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch { /* ignore */ }
+      recognitionRef.current = null;
+    }
     if (processorRef.current) {
       processorRef.current.onaudioprocess = null;
       processorRef.current.disconnect();
@@ -161,15 +177,9 @@ const VoiceAgent = () => {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
     }
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch { /* ignore */ }
-      recognitionRef.current = null;
-    }
     stopPlayback();
     if (captureCtxRef.current) { captureCtxRef.current.close(); captureCtxRef.current = null; }
     if (playbackCtxRef.current) { playbackCtxRef.current.close(); playbackCtxRef.current = null; }
-    setIsActive(false);
-    setStatus('idle');
   };
 
   const playPcm = (base64Audio) => {
@@ -193,16 +203,41 @@ const VoiceAgent = () => {
     source.onended = () => activeSourcesRef.current.delete(source);
   };
 
-  // Speak text using browser speech synthesis
+  // Speak text using browser speech synthesis, then resume listening if session is continuous
   const speakText = (text) => {
-    if (!('speechSynthesis' in window)) return;
+    if (!('speechSynthesis' in window)) {
+      if (isContinuousSessionRef.current) {
+        startSpeechListeningTurn();
+      }
+      return;
+    }
+
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1.0;
     utterance.pitch = 1.0;
     setStatus('speaking');
-    utterance.onend = () => setStatus('idle');
-    utterance.onerror = () => setStatus('idle');
+
+    utterance.onend = () => {
+      // AI finished speaking — if session is continuous, automatically resume listening!
+      if (isContinuousSessionRef.current) {
+        setStatus('listening');
+        setTimeout(() => {
+          startSpeechListeningTurn();
+        }, 350);
+      } else {
+        setStatus('idle');
+      }
+    };
+
+    utterance.onerror = () => {
+      if (isContinuousSessionRef.current) {
+        startSpeechListeningTurn();
+      } else {
+        setStatus('idle');
+      }
+    };
+
     window.speechSynthesis.speak(utterance);
   };
 
@@ -222,16 +257,26 @@ const VoiceAgent = () => {
       if (response.data?.reply) {
         setTranscript(prev => [...prev, { speaker: 'agent', text: response.data.reply }]);
         speakText(response.data.reply);
+      } else {
+        if (isContinuousSessionRef.current) {
+          startSpeechListeningTurn();
+        } else {
+          setStatus('idle');
+        }
       }
     } catch (err) {
       console.error('Chat error:', err);
-      const errMsg = err.response?.data?.error || 'Could not reach Gemini AI. Please check your connection or GEMINI_API_KEY.';
+      const errMsg = err.response?.data?.error || 'Could not reach AI assistant. Please try again.';
       setError(errMsg);
       setTranscript(prev => [...prev, { 
         speaker: 'agent', 
-        text: 'Sorry, I encountered an issue connecting to Gemini. Please verify your GEMINI_API_KEY.' 
+        text: 'Sorry, I encountered an issue. Let us continue, what else would you like to know?' 
       }]);
-      setStatus('idle');
+      if (isContinuousSessionRef.current) {
+        setTimeout(startSpeechListeningTurn, 1000);
+      } else {
+        setStatus('idle');
+      }
     } finally {
       setIsGenerating(false);
     }
@@ -250,14 +295,84 @@ const VoiceAgent = () => {
     if (isSocketConnected && isActive && socketRef.current?.connected && readyRef.current) {
       socketRef.current.emit('user-text', msg);
     } else {
-      // Direct REST API call
       await sendToGemini(msg);
     }
   };
 
-  // Handle Microphone Toggle
+  // Single Speech Recognition Turn (loops continuously while isContinuousSessionRef is true)
+  const startSpeechListeningTurn = () => {
+    if (!isContinuousSessionRef.current) return;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch { /* ignore */ }
+      recognitionRef.current = null;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognitionRef.current = recognition;
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      setStatus('listening');
+
+      let turnTranscript = '';
+
+      recognition.onresult = (event) => {
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            turnTranscript += event.results[i][0].transcript;
+          } else {
+            interim += event.results[i][0].transcript;
+          }
+        }
+        setTextInput(turnTranscript || interim);
+      };
+
+      recognition.onerror = (e) => {
+        console.warn('Speech recognition status:', e.error);
+        // "no-speech" or "aborted" is expected during conversational pauses
+      };
+
+      recognition.onend = async () => {
+        if (!isContinuousSessionRef.current) return;
+
+        // If user said something, send it!
+        if (turnTranscript.trim()) {
+          const spoken = turnTranscript.trim();
+          setTextInput('');
+          setTranscript(prev => [...prev, { speaker: 'user', text: spoken }]);
+          await sendToGemini(spoken);
+        } else {
+          // If no speech was detected (silence), automatically continue listening!
+          if (isContinuousSessionRef.current && status !== 'speaking' && status !== 'thinking') {
+            setTimeout(() => {
+              if (isContinuousSessionRef.current && status !== 'speaking' && status !== 'thinking') {
+                startSpeechListeningTurn();
+              }
+            }, 300);
+          }
+        }
+      };
+
+      recognition.start();
+    } catch (err) {
+      console.warn('Speech start error:', err.message);
+      if (isContinuousSessionRef.current) {
+        setTimeout(startSpeechListeningTurn, 500);
+      }
+    }
+  };
+
+  // Handle Voice Session Toggle (Start vs End)
   const handleToggleMic = async () => {
-    if (isActive) {
+    if (isActive || isContinuousSessionRef.current) {
+      // End the session
       if (isSocketConnected && socketRef.current?.connected) {
         socketRef.current.emit('end-voice');
       }
@@ -266,6 +381,8 @@ const VoiceAgent = () => {
     }
 
     setError(null);
+    isContinuousSessionRef.current = true;
+    setIsActive(true);
 
     // Mode A: If WebSocket audio server is connected, use real-time PCM stream
     if (isSocketConnected && socketRef.current?.connected) {
@@ -301,7 +418,6 @@ const VoiceAgent = () => {
         processor.connect(mute);
         mute.connect(captureCtx.destination);
 
-        setIsActive(true);
         setStatus('connecting');
         socketRef.current.emit('start-voice', { persona });
       } catch (err) {
@@ -312,78 +428,31 @@ const VoiceAgent = () => {
       return;
     }
 
-    // Mode B: Serverless Web Speech Mode (Works 100% on Vercel without WebSockets)
+    // Mode B: Serverless Continuous Web Speech Mode (Works 100% on Vercel)
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
     if (!SpeechRecognition) {
       setError('Speech recognition is not supported in this browser. Please use Chrome, Edge, or Safari, or type your message.');
+      stopCapture();
       return;
     }
 
-    try {
-      const recognition = new SpeechRecognition();
-      recognitionRef.current = recognition;
-      recognition.continuous = false;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      setIsActive(true);
-      setStatus('listening');
-
-      let finalTranscript = '';
-
-      recognition.onresult = (event) => {
-        let interim = '';
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
-          } else {
-            interim += event.results[i][0].transcript;
-          }
-        }
-        setTextInput(finalTranscript || interim);
-      };
-
-      recognition.onerror = (e) => {
-        console.warn('Speech recognition error:', e.error);
-        if (e.error !== 'no-speech') {
-          setError(`Speech error: ${e.error}`);
-        }
-        stopCapture();
-      };
-
-      recognition.onend = async () => {
-        setIsActive(false);
-        if (finalTranscript.trim()) {
-          const userMsg = finalTranscript.trim();
-          setTextInput('');
-          setTranscript(prev => [...prev, { speaker: 'user', text: userMsg }]);
-          await sendToGemini(userMsg);
-        } else {
-          setStatus('idle');
-        }
-      };
-
-      recognition.start();
-    } catch (recErr) {
-      console.error('Speech recognition failed to start:', recErr);
-      setError('Could not access microphone for speech recognition.');
-      stopCapture();
-    }
+    startSpeechListeningTurn();
   };
 
   const getStatusBadge = () => {
     switch (status) {
       case 'connecting':
-        return { text: 'Connecting to Gemini...', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20' };
+        return { text: 'Connecting session...', color: 'text-amber-400', dot: 'bg-amber-400' };
       case 'listening':
-        return { text: 'Listening — speak now...', color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20' };
+        return { text: 'Listening — speak now...', color: 'text-emerald-400', dot: 'bg-emerald-400 animate-pulse' };
       case 'thinking':
-        return { text: 'Gemini is thinking...', color: 'text-indigo-400', bg: 'bg-indigo-500/10 border-indigo-500/20' };
+        return { text: 'Gemini is thinking...', color: 'text-indigo-400', dot: 'bg-indigo-400 animate-ping' };
       case 'speaking':
-        return { text: 'Gemini is speaking...', color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/20' };
+        return { text: 'Gemini is speaking...', color: 'text-purple-400', dot: 'bg-purple-400 animate-pulse' };
       default:
-        return { text: 'Gemini AI Ready', color: 'text-slate-400', bg: 'bg-slate-500/10 border-slate-500/20' };
+        return isActive 
+          ? { text: 'Voice Session Active', color: 'text-emerald-400', dot: 'bg-emerald-400' }
+          : { text: 'AI Ready — Click Start', color: 'text-slate-400', dot: 'bg-slate-400' };
     }
   };
 
@@ -410,8 +479,8 @@ const VoiceAgent = () => {
               Voice Assistant
             </h3>
             <div className="flex items-center gap-1.5 mt-1">
-              <span className={`w-2 h-2 rounded-full ${isActive ? 'bg-emerald-400 animate-pulse' : 'bg-indigo-400'}`} />
-              <span className="text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>
+              <span className={`w-2 h-2 rounded-full ${badge.dot}`} />
+              <span className={`text-[11px] font-medium ${badge.color}`}>
                 {badge.text}
               </span>
             </div>
@@ -530,7 +599,7 @@ const VoiceAgent = () => {
             type="text"
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
-            placeholder="Ask Gemini anything or type a prompt..."
+            placeholder="Type a message or speak continuously..."
             className="flex-1 rounded-xl px-4 py-2.5 text-sm focus:outline-none transition-all"
             style={{
               background: 'var(--surface-raised)',
@@ -557,29 +626,37 @@ const VoiceAgent = () => {
           </button>
         </div>
 
-        {/* Mic Control */}
+        {/* Continuous Voice Session Control */}
         <div className="flex items-center justify-between pt-1">
           <div className="flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full ${isActive ? 'bg-red-500 animate-ping' : 'bg-slate-500'}`} />
-            <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
-              {isActive ? 'Microphone Active — speak now' : 'Tap mic to speak voice prompt'}
+            <span className={`w-2.5 h-2.5 rounded-full ${isActive ? 'bg-emerald-400 animate-ping' : 'bg-slate-600'}`} />
+            <span className="text-xs font-medium" style={{ color: isActive ? '#34d399' : 'var(--text-muted)' }}>
+              {isActive 
+                ? (status === 'speaking' ? 'AI speaking — listening next...' : 'Live session active — speak freely!') 
+                : 'Continuous hands-free conversation'}
             </span>
           </div>
 
           <button 
             type="button"
             onClick={handleToggleMic}
-            className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all duration-200 cursor-pointer shadow-lg"
-            style={{
-              background: isActive 
-                ? 'linear-gradient(135deg, #ef4444, #dc2626)' 
-                : 'var(--surface-raised)',
-              border: `1px solid ${isActive ? '#f87171' : 'var(--border-subtle)'}`,
-              color: 'white'
-            }}
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer shadow-xl ${
+              isActive 
+                ? 'bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white border border-red-400/40 animate-pulse' 
+                : 'bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white border border-indigo-400/30 hover:scale-105'
+            }`}
           >
-            {isActive ? <MicOff size={14} className="text-white" /> : <Mic size={14} className="text-indigo-400" />}
-            <span>{isActive ? 'Stop Mic' : 'Voice Input'}</span>
+            {isActive ? (
+              <>
+                <MicOff size={15} />
+                <span>End Voice Session</span>
+              </>
+            ) : (
+              <>
+                <Mic size={15} />
+                <span>Start Voice Session</span>
+              </>
+            )}
           </button>
         </div>
       </div>
