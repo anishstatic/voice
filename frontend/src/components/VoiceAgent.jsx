@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Mic, MicOff, Send, AlertCircle, Bot, User, Sparkles } from 'lucide-react';
 import io from 'socket.io-client';
-import { WS_BASE } from '../config';
+import axios from 'axios';
+import { API_BASE, WS_BASE } from '../config';
 
 const INPUT_RATE = 16000;   // Gemini expects 16 kHz 16-bit PCM from us
 const OUTPUT_RATE = 24000;  // Gemini sends back 24 kHz 16-bit PCM
@@ -221,10 +222,33 @@ const VoiceAgent = () => {
     }
   };
 
-  const handleSendText = () => {
-    if (textInput.trim() !== '' && isActive) {
-      socketRef.current.emit('user-text', textInput.trim());
-      setTextInput('');
+  const handleSendText = async () => {
+    if (textInput.trim() === '') return;
+    const msg = textInput.trim();
+    setTextInput('');
+
+    if (isActive && socketRef.current?.connected) {
+      socketRef.current.emit('user-text', msg);
+      return;
+    }
+
+    // Direct /api/chat serverless communication for Vercel
+    setTranscript(prev => [...prev, { speaker: 'user', text: msg }]);
+    try {
+      const res = await axios.post(`${API_BASE}/api/chat`, { message: msg, persona });
+      if (res.data?.reply) {
+        setTranscript(prev => [...prev, { speaker: 'agent', text: res.data.reply }]);
+        if ('speechSynthesis' in window) {
+          const utterance = new SpeechSynthesisUtterance(res.data.reply);
+          window.speechSynthesis.speak(utterance);
+        }
+      }
+    } catch (err) {
+      console.error('Chat error:', err);
+      setTranscript(prev => [...prev, { 
+        speaker: 'agent', 
+        text: 'Sorry, I could not reach the AI service right now. Please check your connection or GEMINI_API_KEY.' 
+      }]);
     }
   };
 
