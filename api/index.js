@@ -14,6 +14,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Normalize URL so whether Vercel strips /api or keeps it, Express routes match seamlessly
+app.use((req, res, next) => {
+  if (req.url && !req.url.startsWith('/api')) {
+    req.url = '/api' + req.url;
+  }
+  next();
+});
+
 const JWT_SECRET = process.env.JWT_SECRET || 'voiceai_super_secret_key_2026_change_this';
 
 // Cached MongoDB Connection for Serverless environments
@@ -239,44 +247,74 @@ app.get('/api/trends', authMiddleware, async (req, res) => {
 });
 
 // ---- Serverless AI Chat Route ----------------------------------------------
-app.post('/api/chat', async (req, res) => {
+app.post(['/api/chat', '/chat'], async (req, res) => {
   try {
     const { message, persona } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY || Buffer.from('QVEuQWI4Uk42TDY4cmJ4ckNobkFNVm9xS0l5YzBiU2ZSalZpSW1DWFpKUEFpUDVmRUUwWnc=', 'base64').toString('utf-8');
-
-    const systemPrompt = `You are a ${persona || 'helpful assistant'}. Keep answers concise, natural, and conversational.`;
-    
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ parts: [{ text: message }] }]
-      })
-    });
-
-    const data = await response.json();
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || "I'm here to help!";
-    const tokens = data.usageMetadata?.totalTokenCount || Math.ceil((message.length + reply.length) / 4);
-
-    try {
-      await Session.create({
-        sessionId: Math.random().toString(36).substring(7),
-        status: 'completed',
-        durationSeconds: 5,
-        tokensUsed: tokens,
-        estimatedCost: tokens * 0.000000075,
-        startTime: new Date(),
-        endTime: new Date()
-      });
-    } catch (saveErr) {
-      console.warn('Could not save telemetry session:', saveErr.message);
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: 'Message cannot be empty.' });
     }
 
-    res.json({ reply, tokens });
+    const apiKey = process.env.GEMINI_API_KEY || Buffer.from('QVEuQWI4Uk42TDY4cmJ4ckNobkFNVm9xS0l5YzBiU2ZSalZpSW1DWFpKUEFpUDVmRUUwWnc=', 'base64').toString('utf-8');
+    const systemPrompt = `You are a ${persona || 'helpful assistant'}. Answer the user directly, concisely, and conversationally.`;
+
+    const modelsToTry = [
+      'gemini-2.5-flash',
+      'gemini-2.5-flash-lite',
+      'gemini-3.1-flash-lite',
+      'gemini-3-flash-preview',
+      'gemini-3.5-flash'
+    ];
+
+    let reply = null;
+    let tokens = 0;
+    let lastError = null;
+
+    for (const model of modelsToTry) {
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemPrompt }] },
+            contents: [{ parts: [{ text: message }] }]
+          })
+        });
+
+        const data = await response.json();
+        if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
+          reply = data.candidates[0].content.parts[0].text;
+          tokens = data.usageMetadata?.totalTokenCount || Math.ceil((message.length + reply.length) / 4);
+          break; // Succeeded!
+        } else if (data.error) {
+          lastError = data.error.message;
+          console.warn(`Model ${model} returned error:`, data.error.message);
+        }
+      } catch (err) {
+        lastError = err.message;
+        console.warn(`Failed calling ${model}:`, err.message);
+      }
+    }
+
+    if (!reply) {
+      reply = `I heard your question: "${message}". Google's AI service is currently busy (${lastError || 'Service temporarily unavailable'}). Please try again in a few seconds.`;
+      tokens = Math.ceil((message.length + reply.length) / 4);
+    }
+
+    // Save session in background without blocking response
+    Session.create({
+      sessionId: Math.random().toString(36).substring(7),
+      status: 'completed',
+      durationSeconds: 3,
+      tokensUsed: tokens,
+      estimatedCost: tokens * 0.000000075,
+      startTime: new Date(),
+      endTime: new Date()
+    }).catch(err => console.warn('Telemetry save error:', err.message));
+
+    return res.json({ reply, tokens });
   } catch (err) {
-    console.error('Chat error:', err);
-    res.status(500).json({ error: err.message || 'Error processing AI response.' });
+    console.error('Chat endpoint error:', err);
+    return res.status(500).json({ error: err.message || 'Error processing AI response.' });
   }
 });
 

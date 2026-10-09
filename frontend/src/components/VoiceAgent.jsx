@@ -247,7 +247,7 @@ const VoiceAgent = () => {
     setTranscript(prev => [...prev, { speaker: 'user', text: msg }]);
 
     // If live WebSocket is connected and mic is active, emit via socket
-    if (isSocketConnected && isActive && socketRef.current?.connected) {
+    if (isSocketConnected && isActive && socketRef.current?.connected && readyRef.current) {
       socketRef.current.emit('user-text', msg);
     } else {
       // Direct REST API call
