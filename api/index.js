@@ -11,29 +11,37 @@ app.use(cors());
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'voiceai_super_secret_key_2026_change_this';
-const MONGODB_URI = process.env.MONGODB_URI;
 
 // Cached MongoDB Connection for Serverless environments
-let cachedConnection = null;
+let cached = global.mongoose;
+if (!cached) {
+  cached = global.mongoose = { conn: null, promise: null };
+}
 
 async function connectDB() {
-  if (cachedConnection && mongoose.connection.readyState === 1) {
-    return cachedConnection;
+  if (cached.conn && mongoose.connection.readyState === 1) {
+    return cached.conn;
   }
 
-  if (!MONGODB_URI) {
-    console.warn('⚠️ MONGODB_URI is not set in environment variables');
-    return null;
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error('MONGODB_URI is not set in Vercel Environment Variables. Please add it in Vercel Settings -> Environment Variables.');
+  }
+
+  if (!cached.promise) {
+    const opts = {
+      bufferCommands: false,
+      serverSelectionTimeoutMS: 5000,
+    };
+    cached.promise = mongoose.connect(uri, opts).then((m) => m);
   }
 
   try {
-    cachedConnection = await mongoose.connect(MONGODB_URI, {
-      serverSelectionTimeoutMS: 5000,
-      bufferCommands: false
-    });
+    cached.conn = await cached.promise;
     console.log('✅ MongoDB connected in Vercel Serverless');
-    return cachedConnection;
+    return cached.conn;
   } catch (err) {
+    cached.promise = null;
     console.error('❌ MongoDB serverless connection error:', err.message);
     throw err;
   }
@@ -41,12 +49,16 @@ async function connectDB() {
 
 // Middleware to ensure DB connection before handling requests
 app.use(async (req, res, next) => {
+  // Allow health check to pass without DB
+  if (req.path === '/api/health') return next();
   try {
     await connectDB();
     next();
   } catch (err) {
-    console.error('Database connection middleware error:', err);
-    res.status(503).json({ error: 'Database connection failed. Please check MONGODB_URI.' });
+    console.error('Database connection middleware error:', err.message);
+    return res.status(503).json({ 
+      error: `Database connection failed: ${err.message}. Please check MongoDB Atlas IP Whitelist (add 0.0.0.0/0) and Vercel MONGODB_URI.` 
+    });
   }
 });
 
