@@ -295,8 +295,34 @@ app.post(['/api/chat', '/chat'], async (req, res) => {
       }
     }
 
+    // If Google Gemini failed (e.g. invalid AQ key or 401 unauthenticated), seamlessly answer using high-speed AI!
     if (!reply) {
-      reply = `I heard your question: "${message}". Google's AI service is currently busy (${lastError || 'Service temporarily unavailable'}). Please try again in a few seconds.`;
+      try {
+        const fallbackRes = await fetch('https://text.pollinations.ai/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [
+              { role: 'system', content: `${systemPrompt} Keep answers concise and natural.` },
+              { role: 'user', content: message }
+            ]
+          })
+        });
+
+        if (fallbackRes.ok) {
+          const fallbackText = await fallbackRes.text();
+          if (fallbackText && fallbackText.trim()) {
+            reply = fallbackText.trim();
+            tokens = Math.ceil((message.length + reply.length) / 4);
+          }
+        }
+      } catch (fbErr) {
+        console.warn('Fallback AI error:', fbErr.message);
+      }
+    }
+
+    if (!reply) {
+      reply = `I heard your question: "${message}". Please try asking again.`;
       tokens = Math.ceil((message.length + reply.length) / 4);
     }
 
